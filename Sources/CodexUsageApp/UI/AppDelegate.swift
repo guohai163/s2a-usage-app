@@ -8,7 +8,7 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let service = UsageService()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let statusPopoverController = StatusPopoverViewController()
+    private let statusPopoverController = DynamicPopoverViewController()
     private let statusPanel = UsagePanelWindow(
         contentRect: NSRect(origin: .zero, size: statusPanelSize),
         styleMask: [.borderless],
@@ -38,6 +38,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var refreshSerial = 0
     private var pendingRefreshTasks = 0
     private var currentEndpointHost: String?
+    private var usageState: MenuUsageState = .idle
+    private var endpointState: MenuEndpointState = .idle
+    private var menuFeedbackText: String?
+    private var currentMenuSpec = MenuRenderSpecFactory.makeInitialSpec()
 
     /// 应用启动后配置菜单栏和主窗口，并立即刷新一次数据。
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -73,12 +77,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusPanel.hidesOnDeactivate = true
         statusPanel.isReleasedWhenClosed = false
 
-        statusPopoverController.onRefresh = { [weak self] in
-            self?.refresh()
+        statusPopoverController.onAction = { [weak self] actionID in
+            self?.performMenuAction(actionID)
         }
-        statusPopoverController.onQuit = {
-            NSApp.terminate(nil)
+        statusPopoverController.onSizeChange = { [weak self] size in
+            self?.resizeStatusPanel(to: size)
         }
+        renderMenu()
     }
 
     /// 保留一个可扩展的主窗口，用于展示更完整的用量和节点详情。
@@ -209,6 +214,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusPanel.setFrameOrigin(NSPoint(x: clampedX, y: clampedY))
     }
 
+    private func resizeStatusPanel(to size: NSSize) {
+        statusPanel.setContentSize(size)
+        if statusPanel.isVisible, let button = statusItem.button {
+            positionStatusPanel(relativeTo: button)
+        }
+    }
+
     private func separator() -> NSView {
         let view = NSBox()
         view.boxType = .separator
@@ -237,12 +249,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let serial = refreshSerial
         isRefreshing = true
         pendingRefreshTasks = 2
+        menuFeedbackText = nil
+        usageState = .loading
+        endpointState = .loading
         setRefreshEnabled(false)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = "正在读取本地配置并查询用量..."
-        statusPopoverController.setLoading()
         setEndpointChecking()
-        statusPopoverController.setEndpointChecking()
+        renderMenu()
 
         service.loadUsage { [weak self] result in
             DispatchQueue.main.async {
@@ -258,16 +272,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 switch result {
                 case .success(let snapshot):
+                    self.usageState = .loaded(snapshot)
                     self.update(snapshot)
-                    self.statusPopoverController.update(snapshot)
-                    self.updateStatusItem(with: snapshot)
                     self.statusLabel.textColor = .secondaryLabelColor
                     self.statusLabel.stringValue = snapshot.note ?? "已更新。"
                 case .failure(let error):
-                    self.statusPopoverController.setError(error)
+                    self.usageState = .failed(error.localizedDescription)
                     self.statusLabel.textColor = .systemRed
                     self.statusLabel.stringValue = "错误: \(error.localizedDescription)"
                 }
+                self.renderMenu()
             }
         }
 
@@ -285,12 +299,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 switch result {
                 case .success(let recommendation):
+                    self.endpointState = .loaded(recommendation)
                     self.update(recommendation)
-                    self.statusPopoverController.update(recommendation)
                 case .failure(let error):
+                    self.endpointState = .failed(error.localizedDescription)
                     self.setEndpointError(error)
-                    self.statusPopoverController.setEndpointError(error)
                 }
+                self.renderMenu()
             }
         }
     }
@@ -340,12 +355,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if pendingRefreshTasks == 0 {
             isRefreshing = false
             setRefreshEnabled(true)
+            renderMenu()
         }
     }
 
     private func setRefreshEnabled(_ enabled: Bool) {
         refreshButton.isEnabled = enabled
-        statusPopoverController.setRefreshEnabled(enabled)
     }
 
     @objc private func copyEndpointHostPressed() {
@@ -358,10 +373,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         endpointDetailLabel.stringValue = "已复制域名 \(host)"
     }
 
-    private func updateStatusItem(with snapshot: UsageSnapshot) {
-        let remaining = snapshot.dailyLimit > 0
-            ? max(0, min(100, 100 - snapshot.dailyUsage / snapshot.dailyLimit * 100))
-            : 0
-        statusItem.button?.title = " \(Int(remaining.rounded()))%"
+    private func renderMenu() {
+        currentMenuSpec = MenuRenderSpecFactory.makeSpec(
+            for: MenuPresentationState(
+                usage: usageState,
+                endpoint: endpointState,
+                isRefreshing: isRefreshing,
+                feedbackText: menuFeedbackText
+            )
+        )
+        statusPopoverController.render(currentMenuSpec)
+        applyStatusItem(from: currentMenuSpec)
+    }
+
+    private func applyStatusItem(from spec: MenuRenderSpec) {
+        guard let button = statusItem.button else {
+            return
+        }
+
+        let resolver = MenuBindingResolver(data: spec.data)
+        if let icon = spec.statusItem.icon {
+            switch icon.type {
+            case "builtin" where icon.name == "codexTemplate":
+                button.image = makeCodexStatusIcon()
+            case "system":
+                button.image = NSImage(systemSymbolName: icon.name, accessibilityDescription: spec.statusItem.tooltip)
+                button.image?.isTemplate = true
+            default:
+                button.image = makeCodexStatusIcon()
+            }
+        }
+
+        if let title = spec.statusItem.title {
+            button.title = resolver.resolveString(title.text)
+            button.font = font(named: title.font)
+        }
+        button.toolTip = resolver.resolveString(spec.statusItem.tooltip)
+    }
+
+    private func performMenuAction(_ actionID: String) {
+        guard let action = currentMenuSpec.actions[actionID] else {
+            showMenuFeedback("未知动作: \(actionID)")
+            return
+        }
+
+        let resolver = MenuBindingResolver(data: currentMenuSpec.data)
+        switch action.type {
+        case "app.refresh":
+            refresh()
+        case "clipboard.copy":
+            let value = resolver.resolveString(action.value)
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                showMenuFeedback("没有可复制的内容")
+                return
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(value, forType: .string)
+            let feedback = resolver.resolveString(action.feedback)
+            showMenuFeedback(feedback.isEmpty ? "已复制" : feedback)
+        case "system.openURL":
+            let value = resolver.resolveString(action.url)
+            guard let url = URL(string: value) else {
+                showMenuFeedback("URL 无效: \(value)")
+                return
+            }
+            NSWorkspace.shared.open(url)
+        case "app.openPage":
+            openMainWindow(page: action.page, params: action.params)
+        case "app.quit":
+            NSApp.terminate(nil)
+        default:
+            showMenuFeedback("不支持的动作: \(action.type)")
+        }
+    }
+
+    private func showMenuFeedback(_ text: String) {
+        menuFeedbackText = text
+        renderMenu()
+    }
+
+    private func openMainWindow(page: String?, params: [String: JSONValue]?) {
+        if page == "usage.detail" {
+            statusLabel.textColor = .secondaryLabelColor
+            statusLabel.stringValue = "已打开用量详情。"
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func font(named name: String?) -> NSFont {
+        switch name {
+        case "mono12Semibold":
+            return .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        default:
+            return .systemFont(ofSize: 12, weight: .semibold)
+        }
     }
 }

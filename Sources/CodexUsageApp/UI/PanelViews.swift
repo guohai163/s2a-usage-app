@@ -101,6 +101,12 @@ final class GlassPanelView: NSView {
         applyAppearance()
     }
 
+    func updateChrome(cornerRadius: Double?) {
+        if let cornerRadius {
+            layer?.cornerRadius = CGFloat(cornerRadius)
+        }
+    }
+
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }

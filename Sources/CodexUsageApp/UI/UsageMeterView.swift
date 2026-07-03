@@ -77,6 +77,13 @@ final class UsageMeterView: NSView {
         amountLabel.stringValue = "$\(Self.amount(usage)) / $\(Self.amount(limit))"
     }
 
+    /// 用 DSL 已经格式化好的展示值刷新视图。
+    func update(progress: Double, percent: String, amount: String) {
+        self.progress.progress = max(0, min(progress, 1))
+        percentLabel.stringValue = percent
+        amountLabel.stringValue = amount
+    }
+
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyAppearance()

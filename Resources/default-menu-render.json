@@ -1,0 +1,138 @@
+{
+  "schema": "codex.menu.render.v1",
+  "statusItem": {
+    "icon": { "type": "builtin", "name": "codexTemplate" },
+    "title": { "text": "{{statusItem.title}}", "font": "mono12Semibold" },
+    "tooltip": "Codex Usage"
+  },
+  "panel": {
+    "size": { "mode": "fixed", "width": 292, "height": 386 },
+    "chrome": { "type": "glass", "cornerRadius": 14 },
+    "padding": { "top": 10, "horizontal": 12, "bottom": 0 },
+    "root": {
+      "type": "vstack",
+      "spacing": 7,
+      "children": [
+        {
+          "type": "hstack",
+          "distribution": "spaceBetween",
+          "children": [
+            { "type": "text", "text": "Codex Usage", "style": "title" },
+            {
+              "type": "hstack",
+              "spacing": 2,
+              "children": [
+                {
+                  "type": "button",
+                  "icon": "arrow.clockwise",
+                  "tooltip": "刷新用量",
+                  "enabled": "{{controls.canRefresh}}",
+                  "action": "refresh"
+                },
+                {
+                  "type": "button",
+                  "icon": "rectangle.portrait.and.arrow.right",
+                  "tooltip": "退出",
+                  "action": "quit"
+                }
+              ]
+            }
+          ]
+        },
+        { "type": "separator" },
+        {
+          "type": "hstack",
+          "distribution": "spaceBetween",
+          "alignment": "lastBaseline",
+          "children": [
+            { "type": "text", "text": "{{summary.value}}", "style": "summaryAmount" },
+            { "type": "text", "text": "{{summary.caption}}", "style": "caption" }
+          ]
+        },
+        {
+          "type": "forEach",
+          "items": "{{usageRows}}",
+          "template": {
+            "type": "meter",
+            "title": "{{item.title}}",
+            "icon": "{{item.icon}}",
+            "progress": "{{item.progress}}",
+            "percent": "{{item.percent}}",
+            "amount": "{{item.amount}}",
+            "color": "{{item.color}}"
+          }
+        },
+        {
+          "type": "vstack",
+          "spacing": 3,
+          "children": [
+            {
+              "type": "hstack",
+              "distribution": "spaceBetween",
+              "children": [
+                { "type": "text", "text": "{{endpoint.title}}", "style": "sectionTitle" },
+                { "type": "text", "text": "{{endpoint.source}}", "style": "caption" }
+              ]
+            },
+            {
+              "type": "hstack",
+              "spacing": 6,
+              "children": [
+                {
+                  "type": "text",
+                  "text": "{{endpoint.hostText}}",
+                  "style": "monoSmall",
+                  "selectable": true
+                },
+                {
+                  "type": "button",
+                  "icon": "doc.on.doc",
+                  "tooltip": "复制推荐域名",
+                  "enabled": "{{endpoint.canCopy}}",
+                  "action": "copyEndpoint"
+                }
+              ]
+            },
+            {
+              "type": "list",
+              "items": "{{endpoint.lines}}",
+              "limit": 5,
+              "style": "{{endpoint.lineStyle}}"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "text": "{{status.text}}",
+          "style": "{{status.style}}",
+          "visible": "{{status.visible}}"
+        },
+        {
+          "type": "footerBar",
+          "height": 32,
+          "left": { "text": "{{footer.left}}", "style": "footerText" },
+          "right": { "text": "{{footer.right}}", "style": "footerText" }
+        }
+      ]
+    }
+  },
+  "data": {},
+  "actions": {
+    "refresh": { "type": "app.refresh" },
+    "copyEndpoint": {
+      "type": "clipboard.copy",
+      "value": "{{endpoint.host}}",
+      "feedback": "已复制域名 {{endpoint.host}}"
+    },
+    "quit": { "type": "app.quit" },
+    "openBrowser": {
+      "type": "system.openURL",
+      "url": "https://example.com"
+    },
+    "openUsagePage": {
+      "type": "app.openPage",
+      "page": "usage.detail",
+      "params": { "tab": "endpoints" }
+    }
+  }
+}
