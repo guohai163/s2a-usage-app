@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 private let barWidth = 20
-private let statusPanelSize = NSSize(width: 236, height: 246)
+private let statusPanelSize = NSSize(width: 292, height: 386)
 
 private func isDarkAppearance(_ appearance: NSAppearance) -> Bool {
     appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -122,6 +122,130 @@ struct UsageSnapshot {
     let note: String?
 }
 
+struct EndpointCandidate: Codable {
+    let name: String
+    let endpoint: String
+    let host: String
+
+    var displayName: String {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedName.isEmpty || trimmedName.caseInsensitiveCompare(host) == .orderedSame {
+            return host
+        }
+        return trimmedName
+    }
+}
+
+struct EndpointProbeResult {
+    let candidate: EndpointCandidate
+    let hopCount: Int
+    let timeoutHops: Int
+    let lastLatencyMs: Double?
+    let averageLatencyMs: Double?
+    let timedOut: Bool
+    let errorMessage: String?
+
+    var score: Double? {
+        guard let latency = lastLatencyMs ?? averageLatencyMs else {
+            return nil
+        }
+
+        return latency
+            + Double(hopCount) * 2.5
+            + Double(timeoutHops) * 35
+            + (timedOut ? 160 : 0)
+    }
+
+    var summaryText: String {
+        if let errorMessage, score == nil {
+            return errorMessage
+        }
+
+        var parts = [latencyText, "\(hopCount) 跳"]
+        if timeoutHops > 0 {
+            parts.append("\(timeoutHops) 个超时跳")
+        }
+        if timedOut {
+            parts.append("已截断")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var latencyText: String {
+        guard let latency = lastLatencyMs ?? averageLatencyMs else {
+            return "无 RTT"
+        }
+        if latency.rounded() == latency {
+            return "\(Int(latency)) ms"
+        }
+        return String(format: "%.1f ms", latency)
+    }
+}
+
+struct EndpointRecommendation {
+    let results: [EndpointProbeResult]
+    let isFromCache: Bool
+    let fallbackReason: String?
+
+    var recommended: EndpointProbeResult? {
+        results
+            .compactMap { result -> (EndpointProbeResult, Double)? in
+                guard let score = result.score else {
+                    return nil
+                }
+                return (result, score)
+            }
+            .min { $0.1 < $1.1 }?
+            .0
+    }
+
+    var recommendedHost: String? {
+        recommended?.candidate.host
+    }
+
+    var sourceLabel: String {
+        isFromCache ? "CACHE" : "NETWORK"
+    }
+
+    private var rankedResults: [EndpointProbeResult] {
+        results.enumerated()
+            .sorted { left, right in
+                let leftScore = left.element.score ?? Double.greatestFiniteMagnitude
+                let rightScore = right.element.score ?? Double.greatestFiniteMagnitude
+                if leftScore == rightScore {
+                    return left.offset < right.offset
+                }
+                return leftScore < rightScore
+            }
+            .map(\.element)
+    }
+
+    var headline: String {
+        guard let recommended else {
+            return "节点推荐 暂不可用"
+        }
+        return "推荐 \(recommended.candidate.displayName)"
+    }
+
+    var detail: String {
+        detailLines.joined(separator: "\n")
+    }
+
+    var detailLines: [String] {
+        guard let recommended else {
+            let failed = results.map { "\($0.candidate.displayName): \($0.summaryText)" }
+            return failed.isEmpty ? ["没有可探测的 custom_endpoints 节点。"] : failed
+        }
+
+        let heading = isFromCache ? "缓存节点 traceroute" : "全部节点 traceroute"
+        let lines = rankedResults.map { result in
+            let marker = result.candidate.host == recommended.candidate.host ? "推荐 " : ""
+            return "\(marker)\(result.candidate.displayName): \(result.summaryText)"
+        }
+        return [heading] + lines
+    }
+}
+
 enum UsageError: LocalizedError {
     case missingFile(String)
     case invalidJSON(String)
@@ -130,8 +254,10 @@ enum UsageError: LocalizedError {
     case missingBaseURL
     case invalidURL(String)
     case httpStatus(Int)
+    case publicSettingsStatus(Int)
     case network(String)
     case missingUsageSchema
+    case missingCustomEndpoints
     case missingNumber(String)
     case missingText(String)
     case invalidLimit
@@ -152,10 +278,14 @@ enum UsageError: LocalizedError {
             return "接口地址无效: \(url)"
         case .httpStatus(let status):
             return "请求用量接口失败，HTTP 状态码: \(status)"
+        case .publicSettingsStatus(let status):
+            return "请求公共设置失败，HTTP 状态码: \(status)"
         case .network(let detail):
-            return "请求用量接口失败: \(detail)"
+            return "网络请求失败: \(detail)"
         case .missingUsageSchema:
             return "响应中没有 subscription，也不是可识别的代理用量格式。"
+        case .missingCustomEndpoints:
+            return "公共设置中没有可识别的 custom_endpoints 节点。"
         case .missingNumber(let field):
             return "subscription.\(field) 缺失或不是数字。"
         case .missingText(let field):
@@ -167,6 +297,7 @@ enum UsageError: LocalizedError {
 }
 
 final class UsageService {
+    private static let endpointCacheKey = "CodexUsage.EndpointCandidatesCache.v1"
     private let authPath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".codex/auth.json")
     private let configPath = FileManager.default.homeDirectoryForCurrentUser
@@ -181,6 +312,41 @@ final class UsageService {
             completion(.failure(error))
         } catch {
             completion(.failure(.network(error.localizedDescription)))
+        }
+    }
+
+    func loadEndpointRecommendation(completion: @escaping (Result<EndpointRecommendation, UsageError>) -> Void) {
+        do {
+            let baseURL = try loadBaseURL()
+            let apiKey = try? loadAPIKey()
+            try fetchPublicSettings(baseURL: baseURL, apiKey: apiKey) { [weak self] result in
+                guard let self else {
+                    return
+                }
+                switch result {
+                case .success(let recommendation):
+                    completion(.success(recommendation))
+                case .failure(let error):
+                    self.completeWithCachedEndpoints(
+                        fallbackReason: error.localizedDescription,
+                        fallbackError: error,
+                        completion: completion
+                    )
+                }
+            }
+        } catch let error as UsageError {
+            completeWithCachedEndpoints(
+                fallbackReason: error.localizedDescription,
+                fallbackError: error,
+                completion: completion
+            )
+        } catch {
+            let usageError = UsageError.network(error.localizedDescription)
+            completeWithCachedEndpoints(
+                fallbackReason: usageError.localizedDescription,
+                fallbackError: usageError,
+                completion: completion
+            )
         }
     }
 
@@ -313,6 +479,453 @@ final class UsageService {
                 completion(.failure(.invalidJSON(error.localizedDescription)))
             }
         }.resume()
+    }
+
+    private func fetchPublicSettings(
+        baseURL: String,
+        apiKey: String?,
+        completion: @escaping (Result<EndpointRecommendation, UsageError>) -> Void
+    ) throws {
+        let url = try publicSettingsURL(from: baseURL)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 12
+        if let apiKey {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(.network(error.localizedDescription)))
+                return
+            }
+            if let http = response as? HTTPURLResponse,
+               http.statusCode < 200 || http.statusCode >= 300 {
+                completion(.failure(.publicSettingsStatus(http.statusCode)))
+                return
+            }
+            guard let data else {
+                completion(.failure(.network("公共设置响应为空")))
+                return
+            }
+
+            do {
+                let object = try JSONSerialization.jsonObject(with: data)
+                let candidates = try Self.parseEndpointCandidates(from: object)
+                DispatchQueue.global(qos: .utility).async {
+                    let recommendation = self.probeEndpoints(candidates, isFromCache: false, fallbackReason: nil)
+                    self.saveEndpointCache(from: recommendation.results.map(\.candidate))
+                    completion(.success(recommendation))
+                }
+            } catch let usageError as UsageError {
+                completion(.failure(usageError))
+            } catch {
+                completion(.failure(.invalidJSON(error.localizedDescription)))
+            }
+        }.resume()
+    }
+
+    private func completeWithCachedEndpoints(
+        fallbackReason: String,
+        fallbackError: UsageError,
+        completion: @escaping (Result<EndpointRecommendation, UsageError>) -> Void
+    ) {
+        let candidates = loadEndpointCache()
+        guard !candidates.isEmpty else {
+            completion(.failure(fallbackError))
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let recommendation = self.probeEndpoints(
+                candidates,
+                isFromCache: true,
+                fallbackReason: fallbackReason
+            )
+            completion(.success(recommendation))
+        }
+    }
+
+    private func publicSettingsURL(from baseURL: String) throws -> URL {
+        var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.hasPrefix("//") {
+            normalized = "https:\(normalized)"
+        } else if !normalized.contains("://") {
+            normalized = "https://\(normalized)"
+        }
+
+        guard var components = URLComponents(string: normalized),
+              components.host?.isEmpty == false else {
+            throw UsageError.invalidURL(baseURL)
+        }
+
+        components.path = "/api/v1/settings/public"
+        components.query = nil
+        components.fragment = nil
+
+        guard let url = components.url else {
+            throw UsageError.invalidURL(baseURL)
+        }
+        return url
+    }
+
+    private func probeEndpoints(
+        _ candidates: [EndpointCandidate],
+        isFromCache: Bool,
+        fallbackReason: String?
+    ) -> EndpointRecommendation {
+        let limitedCandidates = Array(candidates.prefix(4))
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var indexedResults: [(Int, EndpointProbeResult)] = []
+
+        for (index, candidate) in limitedCandidates.enumerated() {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                let result = self.runTraceroute(for: candidate)
+                lock.lock()
+                indexedResults.append((index, result))
+                lock.unlock()
+                group.leave()
+            }
+        }
+
+        group.wait()
+        return EndpointRecommendation(
+            results: indexedResults
+                .sorted { $0.0 < $1.0 }
+                .map { $0.1 },
+            isFromCache: isFromCache,
+            fallbackReason: fallbackReason
+        )
+    }
+
+    private func saveEndpointCache(from candidates: [EndpointCandidate]) {
+        var uniqueCandidates: [EndpointCandidate] = []
+        var seenHosts = Set<String>()
+
+        for candidate in candidates {
+            let key = candidate.host.lowercased()
+            guard !seenHosts.contains(key) else {
+                continue
+            }
+            seenHosts.insert(key)
+            uniqueCandidates.append(candidate)
+        }
+
+        guard !uniqueCandidates.isEmpty,
+              let data = try? JSONEncoder().encode(uniqueCandidates) else {
+            return
+        }
+        UserDefaults.standard.set(data, forKey: Self.endpointCacheKey)
+    }
+
+    private func loadEndpointCache() -> [EndpointCandidate] {
+        guard let data = UserDefaults.standard.data(forKey: Self.endpointCacheKey),
+              let candidates = try? JSONDecoder().decode([EndpointCandidate].self, from: data) else {
+            return []
+        }
+
+        return candidates.filter {
+            !$0.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    private func runTraceroute(for candidate: EndpointCandidate) -> EndpointProbeResult {
+        guard let traceroutePath = Self.traceroutePath() else {
+            return EndpointProbeResult(
+                candidate: candidate,
+                hopCount: 0,
+                timeoutHops: 0,
+                lastLatencyMs: nil,
+                averageLatencyMs: nil,
+                timedOut: false,
+                errorMessage: "未找到 traceroute"
+            )
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: traceroutePath)
+        process.arguments = ["-n", "-q", "1", "-m", "16", "-w", "1", candidate.host]
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        do {
+            try process.run()
+        } catch {
+            return EndpointProbeResult(
+                candidate: candidate,
+                hopCount: 0,
+                timeoutHops: 0,
+                lastLatencyMs: nil,
+                averageLatencyMs: nil,
+                timedOut: false,
+                errorMessage: error.localizedDescription
+            )
+        }
+
+        var timedOut = false
+        let deadline = Date().addingTimeInterval(20)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if process.isRunning {
+            timedOut = true
+            process.terminate()
+        }
+        process.waitUntilExit()
+
+        let output = String(
+            data: outputPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        return Self.parseTracerouteOutput(
+            output,
+            candidate: candidate,
+            timedOut: timedOut,
+            terminationStatus: process.terminationStatus
+        )
+    }
+
+    private static func traceroutePath() -> String? {
+        ["/usr/sbin/traceroute", "/sbin/traceroute", "/usr/bin/traceroute"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private static func parseEndpointCandidates(from object: Any) throws -> [EndpointCandidate] {
+        guard let customEndpoints = findCustomEndpoints(in: object) else {
+            throw UsageError.missingCustomEndpoints
+        }
+
+        let candidates = endpointCandidates(from: customEndpoints, fallbackName: nil)
+        var uniqueCandidates: [EndpointCandidate] = []
+        var seenHosts = Set<String>()
+
+        for candidate in candidates {
+            let key = candidate.host.lowercased()
+            guard !seenHosts.contains(key) else {
+                continue
+            }
+            seenHosts.insert(key)
+            uniqueCandidates.append(candidate)
+        }
+
+        guard !uniqueCandidates.isEmpty else {
+            throw UsageError.missingCustomEndpoints
+        }
+        return uniqueCandidates
+    }
+
+    private static func findCustomEndpoints(in object: Any) -> Any? {
+        if let payload = object as? [String: Any] {
+            if let value = payload["custom_endpoints"] ?? payload["customEndpoints"] {
+                return value
+            }
+            for key in payload.keys.sorted() {
+                guard let value = payload[key] else {
+                    continue
+                }
+                if let found = findCustomEndpoints(in: value) {
+                    return found
+                }
+            }
+        }
+
+        if let array = object as? [Any] {
+            for item in array {
+                if let found = findCustomEndpoints(in: item) {
+                    return found
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private static func endpointCandidates(from value: Any, fallbackName: String?) -> [EndpointCandidate] {
+        if let payload = value as? [String: Any] {
+            if let endpoint = firstText(in: payload, keys: endpointValueKeys),
+               let candidate = makeEndpointCandidate(
+                    name: firstText(in: payload, keys: endpointNameKeys) ?? fallbackName ?? endpoint,
+                    endpoint: endpoint
+               ) {
+                return [candidate]
+            }
+
+            return payload.keys.sorted().flatMap { key -> [EndpointCandidate] in
+                guard let value = payload[key] else {
+                    return []
+                }
+                return endpointCandidates(from: value, fallbackName: displayName(fromKey: key))
+            }
+        }
+
+        if let array = value as? [Any] {
+            return array.enumerated().flatMap { index, item in
+                endpointCandidates(from: item, fallbackName: fallbackName ?? "节点 \(index + 1)")
+            }
+        }
+
+        if let stringValue = value as? String {
+            let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let data = trimmed.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data),
+               trimmed.hasPrefix("[") || trimmed.hasPrefix("{") {
+                return endpointCandidates(from: json, fallbackName: fallbackName)
+            }
+
+            if let candidate = makeEndpointCandidate(name: fallbackName ?? trimmed, endpoint: trimmed) {
+                return [candidate]
+            }
+        }
+
+        return []
+    }
+
+    private static let endpointNameKeys = [
+        "name",
+        "label",
+        "title",
+        "display_name",
+        "displayName",
+        "region"
+    ]
+
+    private static let endpointValueKeys = [
+        "url",
+        "base_url",
+        "baseURL",
+        "endpoint",
+        "api_base",
+        "apiBase",
+        "value",
+        "host",
+        "domain"
+    ]
+
+    private static func firstText(in payload: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            guard let value = payload[key] as? String else {
+                continue
+            }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return nil
+    }
+
+    private static func makeEndpointCandidate(name: String, endpoint: String) -> EndpointCandidate? {
+        let trimmedEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let host = host(from: trimmedEndpoint) else {
+            return nil
+        }
+        return EndpointCandidate(name: name, endpoint: trimmedEndpoint, host: host)
+    }
+
+    private static func host(from endpoint: String) -> String? {
+        var normalized = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return nil
+        }
+
+        if normalized.hasPrefix("//") {
+            normalized = "https:\(normalized)"
+        } else if !normalized.contains("://") {
+            normalized = "https://\(normalized)"
+        }
+
+        if let host = URLComponents(string: normalized)?.host,
+           !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return host
+        }
+
+        let withoutScheme = endpoint
+            .replacingOccurrences(of: "https://", with: "")
+            .replacingOccurrences(of: "http://", with: "")
+        let hostPart = withoutScheme
+            .split(separator: "/")
+            .first?
+            .split(separator: ":")
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return hostPart?.isEmpty == false ? hostPart : nil
+    }
+
+    private static func displayName(fromKey key: String) -> String {
+        key.replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func parseTracerouteOutput(
+        _ output: String,
+        candidate: EndpointCandidate,
+        timedOut: Bool,
+        terminationStatus: Int32
+    ) -> EndpointProbeResult {
+        var hopCount = 0
+        var timeoutHops = 0
+        var latencies: [Double] = []
+
+        for line in output.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let firstToken = trimmed.split(separator: " ").first,
+                  let hopNumber = Int(firstToken) else {
+                continue
+            }
+
+            hopCount = max(hopCount, hopNumber)
+            if trimmed.contains("*") {
+                timeoutHops += 1
+            }
+            latencies.append(contentsOf: latencyValues(in: trimmed))
+        }
+
+        let averageLatency = latencies.isEmpty
+            ? nil
+            : latencies.reduce(0, +) / Double(latencies.count)
+        let lastLatency = latencies.last
+        let errorMessage = latencies.isEmpty && terminationStatus != 0
+            ? firstUsefulLine(in: output) ?? "traceroute 未返回可用数据"
+            : nil
+
+        return EndpointProbeResult(
+            candidate: candidate,
+            hopCount: hopCount,
+            timeoutHops: timeoutHops,
+            lastLatencyMs: lastLatency,
+            averageLatencyMs: averageLatency,
+            timedOut: timedOut,
+            errorMessage: errorMessage
+        )
+    }
+
+    private static func latencyValues(in text: String) -> [Double] {
+        guard let regex = try? NSRegularExpression(
+            pattern: "([0-9]+(?:\\.[0-9]+)?)\\s*ms",
+            options: [.caseInsensitive]
+        ) else {
+            return []
+        }
+
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: range).compactMap { match in
+            guard let valueRange = Range(match.range(at: 1), in: text) else {
+                return nil
+            }
+            return Double(text[valueRange])
+        }
+    }
+
+    private static func firstUsefulLine(in output: String) -> String? {
+        output.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
     }
 
     private static func parseSnapshot(from object: Any) throws -> UsageSnapshot {
@@ -744,9 +1357,16 @@ final class StatusPopoverViewController: NSViewController {
     private let monthlyRow = UsageMeterView(name: "Monthly", symbolName: "chart.bar", color: .systemPurple)
     private let expiresLabel = NSTextField(labelWithString: "Expires: -")
     private let schemaLabel = NSTextField(labelWithString: "等待刷新")
+    private let endpointLabel = NSTextField(labelWithString: "节点推荐 -")
+    private let endpointCaption = NSTextField(labelWithString: "NETWORK")
+    private let endpointDomainLabel = NSTextField(labelWithString: "域名 -")
+    private let endpointResultsStack = NSStackView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let refreshButton = NSButton()
+    private let copyEndpointButton = NSButton()
     private let quitButton = NSButton()
+    private var currentEndpointHost: String?
+    private var endpointResultsUseErrorColor = false
 
     var onRefresh: (() -> Void)?
     var onQuit: (() -> Void)?
@@ -776,6 +1396,21 @@ final class StatusPopoverViewController: NSViewController {
         schemaLabel.lineBreakMode = .byTruncatingTail
         schemaLabel.maximumNumberOfLines = 1
         schemaLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        endpointLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        endpointLabel.lineBreakMode = .byTruncatingMiddle
+        endpointLabel.maximumNumberOfLines = 1
+        endpointLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        endpointCaption.font = .systemFont(ofSize: 10, weight: .semibold)
+        endpointCaption.alignment = .right
+        endpointDomainLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+        endpointDomainLabel.lineBreakMode = .byTruncatingMiddle
+        endpointDomainLabel.maximumNumberOfLines = 1
+        endpointDomainLabel.isSelectable = true
+        endpointDomainLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        endpointResultsStack.orientation = .vertical
+        endpointResultsStack.alignment = .width
+        endpointResultsStack.spacing = 3
+        endpointResultsStack.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.isHidden = true
@@ -783,6 +1418,11 @@ final class StatusPopoverViewController: NSViewController {
         configureIconButton(refreshButton, symbolName: "arrow.clockwise", accessibility: "刷新用量")
         refreshButton.target = self
         refreshButton.action = #selector(refreshPressed)
+
+        configureIconButton(copyEndpointButton, symbolName: "doc.on.doc", accessibility: "复制推荐域名")
+        copyEndpointButton.target = self
+        copyEndpointButton.action = #selector(copyEndpointHostPressed)
+        copyEndpointButton.isEnabled = false
 
         configureIconButton(quitButton, symbolName: "rectangle.portrait.and.arrow.right", accessibility: "退出")
         quitButton.target = self
@@ -811,6 +1451,27 @@ final class StatusPopoverViewController: NSViewController {
         rows.spacing = 7
         rows.translatesAutoresizingMaskIntoConstraints = false
 
+        let endpointHeader = NSStackView(views: [endpointLabel, endpointCaption])
+        endpointHeader.orientation = .horizontal
+        endpointHeader.alignment = .centerY
+        endpointHeader.distribution = .gravityAreas
+        endpointHeader.translatesAutoresizingMaskIntoConstraints = false
+
+        let endpointDomainRow = NSStackView(views: [endpointDomainLabel, copyEndpointButton])
+        endpointDomainRow.orientation = .horizontal
+        endpointDomainRow.alignment = .centerY
+        endpointDomainRow.distribution = .fill
+        endpointDomainRow.spacing = 6
+        endpointDomainRow.translatesAutoresizingMaskIntoConstraints = false
+
+        setEndpointResultLines(["等待探测"])
+
+        let endpointStack = NSStackView(views: [endpointHeader, endpointDomainRow, endpointResultsStack])
+        endpointStack.orientation = .vertical
+        endpointStack.alignment = .width
+        endpointStack.spacing = 3
+        endpointStack.translatesAutoresizingMaskIntoConstraints = false
+
         let footer = NSStackView(views: [expiresLabel, schemaLabel])
         footer.orientation = .horizontal
         footer.alignment = .centerY
@@ -821,7 +1482,7 @@ final class StatusPopoverViewController: NSViewController {
         footerBar.translatesAutoresizingMaskIntoConstraints = false
         footerBar.addSubview(footer)
 
-        let stack = NSStackView(views: [header, separator(), summaryRow, rows, statusLabel])
+        let stack = NSStackView(views: [header, separator(), summaryRow, rows, endpointStack, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .width
         stack.spacing = 7
@@ -832,11 +1493,17 @@ final class StatusPopoverViewController: NSViewController {
         NSLayoutConstraint.activate([
             refreshButton.widthAnchor.constraint(equalToConstant: 22),
             refreshButton.heightAnchor.constraint(equalToConstant: 22),
+            copyEndpointButton.widthAnchor.constraint(equalToConstant: 20),
+            copyEndpointButton.heightAnchor.constraint(equalToConstant: 20),
             quitButton.widthAnchor.constraint(equalToConstant: 22),
             quitButton.heightAnchor.constraint(equalToConstant: 22),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             summaryRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             rows.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            endpointStack.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            endpointHeader.widthAnchor.constraint(equalTo: endpointStack.widthAnchor),
+            endpointDomainRow.widthAnchor.constraint(equalTo: endpointStack.widthAnchor),
+            endpointResultsStack.widthAnchor.constraint(equalTo: endpointStack.widthAnchor),
             dailyRow.widthAnchor.constraint(equalTo: rows.widthAnchor),
             weeklyRow.widthAnchor.constraint(equalTo: rows.widthAnchor),
             monthlyRow.widthAnchor.constraint(equalTo: rows.widthAnchor),
@@ -863,14 +1530,12 @@ final class StatusPopoverViewController: NSViewController {
     }
 
     func setError(_ error: Error) {
-        refreshButton.isEnabled = true
         statusLabel.isHidden = false
         statusLabel.textColor = .systemRed
         statusLabel.stringValue = "错误: \(error.localizedDescription)"
     }
 
     func update(_ snapshot: UsageSnapshot) {
-        refreshButton.isEnabled = true
         dailyRow.update(usage: snapshot.dailyUsage, limit: snapshot.dailyLimit)
         weeklyRow.update(usage: snapshot.weeklyUsage, limit: snapshot.weeklyLimit)
         monthlyRow.update(usage: snapshot.monthlyUsage, limit: snapshot.monthlyLimit)
@@ -880,6 +1545,75 @@ final class StatusPopoverViewController: NSViewController {
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = ""
         statusLabel.isHidden = true
+    }
+
+    func setEndpointChecking() {
+        currentEndpointHost = nil
+        endpointLabel.stringValue = "节点推荐 探测中"
+        endpointCaption.stringValue = "NETWORK"
+        endpointDomainLabel.stringValue = "域名 -"
+        setEndpointResultLines(["正在读取公共设置并运行 traceroute"])
+        copyEndpointButton.isEnabled = false
+    }
+
+    func setEndpointError(_ error: Error) {
+        currentEndpointHost = nil
+        endpointLabel.stringValue = "节点推荐 暂不可用"
+        endpointCaption.stringValue = "NETWORK"
+        endpointDomainLabel.stringValue = "域名 -"
+        setEndpointResultLines([error.localizedDescription], isError: true)
+        copyEndpointButton.isEnabled = false
+    }
+
+    func update(_ recommendation: EndpointRecommendation) {
+        currentEndpointHost = recommendation.recommendedHost
+        endpointLabel.stringValue = recommendation.headline
+        endpointCaption.stringValue = recommendation.sourceLabel
+        endpointDomainLabel.stringValue = recommendation.recommendedHost ?? "域名 -"
+        setEndpointResultLines(recommendation.detailLines)
+        copyEndpointButton.isEnabled = recommendation.recommendedHost != nil
+    }
+
+    func setRefreshEnabled(_ enabled: Bool) {
+        refreshButton.isEnabled = enabled
+    }
+
+    private func setEndpointResultLines(_ lines: [String], isError: Bool = false) {
+        endpointResultsUseErrorColor = isError
+        endpointResultsStack.arrangedSubviews.forEach { view in
+            endpointResultsStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        for (index, line) in lines.prefix(5).enumerated() {
+            let label = NSTextField(labelWithString: line)
+            label.font = index == 0
+                ? .systemFont(ofSize: 10, weight: .semibold)
+                : .systemFont(ofSize: 10, weight: .medium)
+            label.alignment = .left
+            label.lineBreakMode = .byTruncatingMiddle
+            label.maximumNumberOfLines = 1
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            label.translatesAutoresizingMaskIntoConstraints = false
+            endpointResultsStack.addArrangedSubview(label)
+            label.widthAnchor.constraint(equalTo: endpointResultsStack.widthAnchor).isActive = true
+        }
+        applyEndpointResultAppearance()
+    }
+
+    private func applyEndpointResultAppearance() {
+        let color: NSColor
+        if endpointResultsUseErrorColor {
+            color = .systemRed
+        } else if isDarkAppearance(view.effectiveAppearance) {
+            color = NSColor.white.withAlphaComponent(0.58)
+        } else {
+            color = .secondaryLabelColor
+        }
+
+        for case let label as NSTextField in endpointResultsStack.arrangedSubviews {
+            label.textColor = color
+        }
     }
 
     private func configureIconButton(_ button: NSButton, symbolName: String, accessibility: String) {
@@ -900,8 +1634,13 @@ final class StatusPopoverViewController: NSViewController {
             remainingCaption.textColor = secondary
             expiresLabel.textColor = secondary
             schemaLabel.textColor = secondary
+            endpointLabel.textColor = primary
+            endpointCaption.textColor = secondary
+            endpointDomainLabel.textColor = primary
+            applyEndpointResultAppearance()
             statusLabel.textColor = tertiary
             refreshButton.contentTintColor = secondary
+            copyEndpointButton.contentTintColor = secondary
             quitButton.contentTintColor = secondary
         } else {
             titleLabel.textColor = .labelColor
@@ -909,8 +1648,13 @@ final class StatusPopoverViewController: NSViewController {
             remainingCaption.textColor = .secondaryLabelColor
             expiresLabel.textColor = .secondaryLabelColor
             schemaLabel.textColor = .secondaryLabelColor
+            endpointLabel.textColor = .labelColor
+            endpointCaption.textColor = .secondaryLabelColor
+            endpointDomainLabel.textColor = .labelColor
+            applyEndpointResultAppearance()
             statusLabel.textColor = .secondaryLabelColor
             refreshButton.contentTintColor = .secondaryLabelColor
+            copyEndpointButton.contentTintColor = .secondaryLabelColor
             quitButton.contentTintColor = .secondaryLabelColor
         }
     }
@@ -925,6 +1669,15 @@ final class StatusPopoverViewController: NSViewController {
 
     @objc private func refreshPressed() {
         onRefresh?()
+    }
+
+    @objc private func copyEndpointHostPressed() {
+        guard let host = currentEndpointHost else {
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(host, forType: .string)
+        setEndpointResultLines(["已复制域名 \(host)"])
     }
 
     @objc private func quitPressed() {
@@ -966,7 +1719,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         defer: false
     )
     private let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 720, height: 380),
+        contentRect: NSRect(x: 0, y: 0, width: 720, height: 430),
         styleMask: [.titled, .closable, .miniaturizable, .resizable],
         backing: .buffered,
         defer: false
@@ -979,8 +1732,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let weeklyRow = UsageMeterView(name: "Weekly", symbolName: "calendar", color: .systemIndigo)
     private let monthlyRow = UsageMeterView(name: "Monthly", symbolName: "chart.bar", color: .systemPurple)
     private let expiresLabel = NSTextField(labelWithString: "Expires  -")
+    private let endpointTitleLabel = NSTextField(labelWithString: "节点推荐  -")
+    private let endpointHostLabel = NSTextField(labelWithString: "域名  -")
+    private let endpointDetailLabel = NSTextField(labelWithString: "等待 traceroute")
+    private let copyEndpointButton = NSButton()
     private let statusLabel = NSTextField(labelWithString: "")
     private var isRefreshing = false
+    private var refreshSerial = 0
+    private var pendingRefreshTasks = 0
+    private var currentEndpointHost: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
@@ -1042,6 +1802,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButton.bezelStyle = .rounded
 
         expiresLabel.font = .monospacedSystemFont(ofSize: 14, weight: .medium)
+        endpointTitleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        endpointTitleLabel.lineBreakMode = .byTruncatingMiddle
+        endpointHostLabel.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        endpointHostLabel.textColor = .labelColor
+        endpointHostLabel.lineBreakMode = .byTruncatingMiddle
+        endpointHostLabel.isSelectable = true
+        endpointDetailLabel.font = .systemFont(ofSize: 13)
+        endpointDetailLabel.alignment = .left
+        endpointDetailLabel.textColor = .secondaryLabelColor
+        endpointDetailLabel.maximumNumberOfLines = 5
+        endpointDetailLabel.lineBreakMode = .byWordWrapping
+        endpointDetailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        configureIconButton(copyEndpointButton, symbolName: "doc.on.doc", accessibility: "复制推荐域名")
+        copyEndpointButton.target = self
+        copyEndpointButton.action = #selector(copyEndpointHostPressed)
+        copyEndpointButton.isEnabled = false
         statusLabel.font = .systemFont(ofSize: 13)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.maximumNumberOfLines = 3
@@ -1062,7 +1838,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rows.alignment = .width
         rows.spacing = 10
 
-        let mainStack = NSStackView(views: [header, separator(), rows, expiresLabel, statusLabel])
+        let endpointHeader = NSStackView(views: [endpointTitleLabel, copyEndpointButton])
+        endpointHeader.orientation = .horizontal
+        endpointHeader.alignment = .centerY
+        endpointHeader.distribution = .gravityAreas
+        endpointHeader.spacing = 8
+
+        let endpointStack = NSStackView(views: [endpointHeader, endpointHostLabel, endpointDetailLabel])
+        endpointStack.orientation = .vertical
+        endpointStack.alignment = .leading
+        endpointStack.spacing = 5
+
+        let mainStack = NSStackView(views: [header, separator(), rows, expiresLabel, endpointStack, statusLabel])
         mainStack.orientation = .vertical
         mainStack.alignment = .leading
         mainStack.spacing = 22
@@ -1075,7 +1862,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             mainStack.topAnchor.constraint(equalTo: content.topAnchor, constant: 30),
             mainStack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -28),
             header.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            rows.widthAnchor.constraint(equalTo: mainStack.widthAnchor)
+            rows.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            endpointStack.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            endpointHeader.widthAnchor.constraint(equalTo: endpointStack.widthAnchor),
+            endpointHostLabel.widthAnchor.constraint(equalTo: endpointStack.widthAnchor),
+            endpointDetailLabel.widthAnchor.constraint(equalTo: endpointStack.widthAnchor),
+            copyEndpointButton.widthAnchor.constraint(equalToConstant: 24),
+            copyEndpointButton.heightAnchor.constraint(equalToConstant: 24)
         ])
 
         window.orderOut(nil)
@@ -1124,6 +1917,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return view
     }
 
+    private func configureIconButton(_ button: NSButton, symbolName: String, accessibility: String) {
+        button.title = ""
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibility)
+        button.image?.isTemplate = true
+        button.bezelStyle = .rounded
+    }
+
     @objc private func refreshButtonPressed() {
         refresh()
     }
@@ -1132,19 +1932,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isRefreshing else {
             return
         }
+        refreshSerial += 1
+        let serial = refreshSerial
         isRefreshing = true
-        refreshButton.isEnabled = false
+        pendingRefreshTasks = 2
+        setRefreshEnabled(false)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = "正在读取本地配置并查询用量..."
         statusPopoverController.setLoading()
+        setEndpointChecking()
+        statusPopoverController.setEndpointChecking()
 
         service.loadUsage { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else {
                     return
                 }
-                self.isRefreshing = false
-                self.refreshButton.isEnabled = true
+                guard self.refreshSerial == serial else {
+                    return
+                }
+                defer {
+                    self.finishRefreshTask(serial: serial)
+                }
 
                 switch result {
                 case .success(let snapshot):
@@ -1160,6 +1969,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+
+        service.loadEndpointRecommendation { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else {
+                    return
+                }
+                guard self.refreshSerial == serial else {
+                    return
+                }
+                defer {
+                    self.finishRefreshTask(serial: serial)
+                }
+
+                switch result {
+                case .success(let recommendation):
+                    self.update(recommendation)
+                    self.statusPopoverController.update(recommendation)
+                case .failure(let error):
+                    self.setEndpointError(error)
+                    self.statusPopoverController.setEndpointError(error)
+                }
+            }
+        }
     }
 
     private func update(_ snapshot: UsageSnapshot) {
@@ -1167,6 +1999,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         weeklyRow.update(usage: snapshot.weeklyUsage, limit: snapshot.weeklyLimit)
         monthlyRow.update(usage: snapshot.monthlyUsage, limit: snapshot.monthlyLimit)
         expiresLabel.stringValue = "Expires  \(snapshot.expiresAt)"
+    }
+
+    private func setEndpointChecking() {
+        currentEndpointHost = nil
+        endpointTitleLabel.stringValue = "节点推荐  探测中"
+        endpointTitleLabel.textColor = .labelColor
+        endpointHostLabel.stringValue = "域名  -"
+        copyEndpointButton.isEnabled = false
+        endpointDetailLabel.textColor = .secondaryLabelColor
+        endpointDetailLabel.stringValue = "正在读取 /api/v1/settings/public 并运行 traceroute..."
+    }
+
+    private func setEndpointError(_ error: Error) {
+        currentEndpointHost = nil
+        endpointTitleLabel.stringValue = "节点推荐  暂不可用"
+        endpointTitleLabel.textColor = .labelColor
+        endpointHostLabel.stringValue = "域名  -"
+        copyEndpointButton.isEnabled = false
+        endpointDetailLabel.textColor = .systemRed
+        endpointDetailLabel.stringValue = error.localizedDescription
+    }
+
+    private func update(_ recommendation: EndpointRecommendation) {
+        currentEndpointHost = recommendation.recommendedHost
+        endpointTitleLabel.stringValue = recommendation.headline
+        endpointTitleLabel.textColor = .labelColor
+        endpointHostLabel.stringValue = "域名  \(recommendation.recommendedHost ?? "-")"
+        endpointDetailLabel.textColor = .secondaryLabelColor
+        endpointDetailLabel.stringValue = recommendation.detail
+        copyEndpointButton.isEnabled = recommendation.recommendedHost != nil
+    }
+
+    private func finishRefreshTask(serial: Int) {
+        guard refreshSerial == serial else {
+            return
+        }
+        pendingRefreshTasks = max(0, pendingRefreshTasks - 1)
+        if pendingRefreshTasks == 0 {
+            isRefreshing = false
+            setRefreshEnabled(true)
+        }
+    }
+
+    private func setRefreshEnabled(_ enabled: Bool) {
+        refreshButton.isEnabled = enabled
+        statusPopoverController.setRefreshEnabled(enabled)
+    }
+
+    @objc private func copyEndpointHostPressed() {
+        guard let host = currentEndpointHost else {
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(host, forType: .string)
+        endpointDetailLabel.textColor = .secondaryLabelColor
+        endpointDetailLabel.stringValue = "已复制域名 \(host)"
     }
 
     private func updateStatusItem(with snapshot: UsageSnapshot) {
