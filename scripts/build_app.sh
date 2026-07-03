@@ -14,7 +14,11 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$MODULE_CACHE_DIR"
 
 CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR" swiftc \
-  "$ROOT_DIR/Sources/CodexUsageApp/main.swift" \
+  "$ROOT_DIR"/Sources/CodexUsageApp/main.swift \
+  "$ROOT_DIR"/Sources/CodexUsageApp/Models/*.swift \
+  "$ROOT_DIR"/Sources/CodexUsageApp/Services/*.swift \
+  "$ROOT_DIR"/Sources/CodexUsageApp/UI/*.swift \
+  "$ROOT_DIR"/Sources/CodexUsageApp/Utilities/*.swift \
   -o "$MACOS_DIR/CodexUsage" \
   -target arm64-apple-macosx15.0 \
   -sdk "$SDK_PATH" \
