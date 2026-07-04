@@ -1,0 +1,11 @@
+{
+  "name": "gytools-plugins-usage",
+  "displayName": "Codex Usage",
+  "version": "0.1.0",
+  "description": "Display local Codex usage and endpoint recommendations in GY Tools.",
+  "main": "./index.html",
+  "customApi": "./preload.js",
+  "categories": ["utility"],
+  "tags": ["codex", "usage", "status-bar"],
+  "icon": "./icon.png"
+}

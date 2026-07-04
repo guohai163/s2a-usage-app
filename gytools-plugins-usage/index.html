@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Codex Usage</title>
+  <link rel="stylesheet" href="./index.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <section class="topbar" aria-label="Codex Usage">
+      <div>
+        <h1>Codex Usage</h1>
+        <p id="subtitle">读取本机 Codex 配置</p>
+      </div>
+      <div class="actions">
+        <button id="refreshButton" class="primary-button" type="button">刷新</button>
+      </div>
+    </section>
+
+    <section class="summary-grid" aria-label="用量摘要">
+      <article class="summary-panel">
+        <span class="panel-label">Remaining</span>
+        <strong id="remainingValue">-</strong>
+        <span id="schemaLabel">等待刷新</span>
+      </article>
+      <article class="summary-panel">
+        <span class="panel-label">Updated</span>
+        <strong id="updatedValue">-</strong>
+        <span id="statusText">等待刷新</span>
+      </article>
+    </section>
+
+    <section class="meter-panel" aria-label="用量周期">
+      <div class="meter-row" data-period="daily">
+        <div class="meter-head">
+          <span>Daily</span>
+          <span id="dailyPercent">0.0%</span>
+        </div>
+        <div class="meter-track"><div id="dailyFill" class="meter-fill daily"></div></div>
+        <div id="dailyAmount" class="meter-amount">$0 / $1</div>
+      </div>
+
+      <div class="meter-row" data-period="weekly">
+        <div class="meter-head">
+          <span>Weekly</span>
+          <span id="weeklyPercent">0.0%</span>
+        </div>
+        <div class="meter-track"><div id="weeklyFill" class="meter-fill weekly"></div></div>
+        <div id="weeklyAmount" class="meter-amount">$0 / $1</div>
+      </div>
+
+      <div class="meter-row" data-period="monthly">
+        <div class="meter-head">
+          <span>Monthly</span>
+          <span id="monthlyPercent">0.0%</span>
+        </div>
+        <div class="meter-track"><div id="monthlyFill" class="meter-fill monthly"></div></div>
+        <div id="monthlyAmount" class="meter-amount">$0 / $1</div>
+      </div>
+    </section>
+
+    <section class="endpoint-panel" aria-label="节点推荐">
+      <div class="section-head">
+        <div>
+          <span class="panel-label">Endpoint</span>
+          <h2 id="endpointTitle">节点推荐 -</h2>
+        </div>
+        <span id="endpointSource" class="source-pill">-</span>
+      </div>
+      <div class="endpoint-host-row">
+        <code id="endpointHost">-</code>
+        <button id="copyButton" class="ghost-button" type="button" disabled>复制域名</button>
+      </div>
+      <ul id="endpointLines" class="endpoint-lines"></ul>
+      <div class="trace-section">
+        <div class="trace-title-row">
+          <span class="panel-label">Traceroute 链路</span>
+          <span id="traceCount" class="trace-count">0 nodes</span>
+        </div>
+        <div id="traceRoutes" class="trace-routes"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="./index.js"></script>
+</body>
+</html>
