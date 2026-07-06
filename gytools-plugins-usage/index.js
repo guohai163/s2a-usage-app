@@ -1,5 +1,6 @@
 (function () {
-  const LIVE_PROBE_INTERVAL_MS = 10000;
+  const DEFAULT_LIVE_PROBE_INTERVAL_MS = 10000;
+  const WINDOWS_LIVE_PROBE_INTERVAL_MS = 30000;
   const gyTools = resolveGyTools();
   const state = {
     endpoint: null,
@@ -9,6 +10,17 @@
     liveProbeGeneration: 0,
     liveTimerId: null,
     loading: false,
+    platform: '',
+    reset: {
+      appVersion: '',
+      error: null,
+      lastCheckedAt: null,
+      loading: false,
+      maskedKey: null,
+      remaining: null,
+      resetting: false,
+      statusText: '先查询是否还有重置机会',
+    },
     statusRegistered: false,
     statusText: '等待刷新',
     traceStats: {},
@@ -30,6 +42,9 @@
       return;
     }
 
+    state.platform = String(gyTools?.env?.platform || '').toLowerCase();
+    state.reset.appVersion = normalizeAppVersion(gyTools?.env?.appVersion);
+    await loadMaskedResetKey();
     await registerStatusPanel();
     await refreshAll();
   });
@@ -61,6 +76,11 @@
       'monthlyPercent',
       'refreshButton',
       'remainingValue',
+      'resetButton',
+      'resetMaskedKey',
+      'resetQueryButton',
+      'resetRemainingValue',
+      'resetStatusText',
       'schemaLabel',
       'statusText',
       'subtitle',
@@ -81,6 +101,12 @@
     });
     elements.copyButton.addEventListener('click', () => {
       copyEndpointHost();
+    });
+    elements.resetQueryButton.addEventListener('click', () => {
+      queryResetRemaining();
+    });
+    elements.resetButton.addEventListener('click', () => {
+      resetQuota();
     });
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
@@ -277,7 +303,7 @@
     return {
       host: '-',
       source: state.loading ? 'NETWORK' : '-',
-      lines: [state.loading ? '正在读取公共设置并运行 traceroute' : '等待探测'],
+      lines: [state.loading ? '正在读取公共设置并运行路由探测' : '等待探测'],
     };
   }
 
@@ -309,11 +335,141 @@
     elements.updatedValue.textContent = state.updatedAt;
     elements.statusText.textContent = state.statusText;
 
+    renderResetPanel();
     renderPeriod('daily', usage.dailyUsage, usage.dailyLimit);
     renderPeriod('weekly', usage.weeklyUsage, usage.weeklyLimit);
     renderPeriod('monthly', usage.monthlyUsage, usage.monthlyLimit);
     renderEndpoint(statusData.endpoint);
     renderTraceRoutes();
+  }
+
+  function renderResetPanel() {
+    const remaining = Number(state.reset.remaining);
+    const hasKnownRemaining = Number.isFinite(remaining);
+    const hasOpportunity = hasKnownRemaining && remaining > 0;
+    const busy = state.reset.loading || state.reset.resetting;
+    const hasApi = Boolean(gyTools?.custom?.checkQuotaResetRemaining && gyTools?.custom?.resetQuota);
+    const versionSupported = isResetVersionSupported();
+
+    elements.resetRemainingValue.textContent = hasKnownRemaining ? `${remaining} 次` : '-';
+    elements.resetMaskedKey.textContent = state.reset.maskedKey
+      ? `KEY ${state.reset.maskedKey}`
+      : 'KEY -';
+    elements.resetQueryButton.disabled = busy || !hasApi;
+    elements.resetButton.disabled = busy || !hasApi || !hasOpportunity;
+    elements.resetStatusText.textContent = hasApi
+      ? state.reset.statusText
+      : '当前插件 API 不支持重置功能。';
+
+    if (hasApi && hasOpportunity && !versionSupported && !busy && !isVersionGateMessage(state.reset.statusText)) {
+      elements.resetStatusText.textContent = versionGateMessage();
+    }
+  }
+
+  async function loadMaskedResetKey() {
+    if (!gyTools?.custom?.getMaskedAPIKey) return;
+
+    try {
+      const result = await gyTools.custom.getMaskedAPIKey();
+      state.reset.maskedKey = typeof result?.maskedKey === 'string' && result.maskedKey.trim()
+        ? result.maskedKey.trim()
+        : null;
+    } catch (_error) {
+      state.reset.maskedKey = null;
+    }
+  }
+
+  async function queryResetRemaining() {
+    if (state.reset.loading || state.reset.resetting || !gyTools?.custom?.checkQuotaResetRemaining) return;
+
+    state.reset.loading = true;
+    state.reset.error = null;
+    state.reset.statusText = '正在查询重置机会...';
+    render();
+
+    try {
+      const result = await gyTools.custom.checkQuotaResetRemaining();
+      const remaining = normalizeRemaining(result?.remaining);
+      state.reset.remaining = remaining;
+      state.reset.lastCheckedAt = new Date().toLocaleTimeString();
+      state.reset.statusText = remaining > 0
+        ? `还有 ${remaining} 次重置机会，可以执行重置。`
+        : '当前没有可用的重置机会。';
+      if (result?.message) {
+        state.reset.statusText += ` ${result.message}`;
+      }
+    } catch (error) {
+      state.reset.error = errorMessage(error);
+      state.reset.remaining = null;
+      state.reset.statusText = `查询失败: ${state.reset.error}`;
+    } finally {
+      state.reset.loading = false;
+      render();
+      await updateStatusPanel();
+    }
+  }
+
+  async function resetQuota() {
+    const remaining = normalizeRemaining(state.reset.remaining);
+    if (state.reset.loading || state.reset.resetting || remaining <= 0 || !gyTools?.custom?.resetQuota) return;
+    if (!isResetVersionSupported()) {
+      state.reset.error = null;
+      state.reset.statusText = versionGateMessage();
+      render();
+      await updateStatusPanel();
+      return;
+    }
+
+    state.reset.resetting = true;
+    state.reset.error = null;
+    state.reset.statusText = '正在请求重置用量...';
+    render();
+
+    try {
+      const result = await gyTools.custom.resetQuota();
+      if (result?.success === false) {
+        throw new Error(result.message || '重置接口返回失败。');
+      }
+
+      let verifiedRemaining = null;
+      let verifyError = null;
+      try {
+        const verifyResult = await gyTools.custom.checkQuotaResetRemaining();
+        verifiedRemaining = normalizeRemaining(verifyResult?.remaining);
+        state.reset.remaining = verifiedRemaining;
+        state.reset.lastCheckedAt = new Date().toLocaleTimeString();
+      } catch (error) {
+        verifyError = error;
+      }
+
+      if (verifiedRemaining != null) {
+        if (verifiedRemaining >= remaining) {
+          throw new Error(
+            result?.message || `剩余重置机会仍然是 ${verifiedRemaining} 次，系统没有确认本次重置成功。`,
+          );
+        }
+        state.reset.statusText = result?.message || `重置成功，剩余 ${verifiedRemaining} 次机会。`;
+      } else if (result?.success === true) {
+        const fallbackRemaining = result?.remaining != null
+          ? normalizeRemaining(result.remaining)
+          : Math.max(remaining - 1, 0);
+        state.reset.remaining = fallbackRemaining;
+        state.reset.statusText = `重置请求已返回成功，但校验剩余机会失败：${errorMessage(verifyError)}`;
+      } else {
+        throw new Error(
+          `重置接口返回结果不明确，且校验剩余机会失败：${errorMessage(verifyError)}`,
+        );
+      }
+
+      await refreshAll();
+    } catch (error) {
+      state.reset.error = errorMessage(error);
+      state.reset.statusText = `重置失败: ${state.reset.error}`;
+    } finally {
+      state.reset.resetting = false;
+      render();
+      await updateStatusPanel();
+    }
   }
 
   function renderPeriod(key, usage, limit) {
@@ -351,7 +507,7 @@
       empty.className = 'trace-card';
       const summary = document.createElement('div');
       summary.className = 'trace-summary';
-      summary.textContent = '等待 traceroute 链路数据';
+      summary.textContent = '等待路由链路数据';
       empty.appendChild(summary);
       elements.traceRoutes.replaceChildren(empty);
       return;
@@ -390,7 +546,7 @@
       table.appendChild(createMtrHeader());
       const hops = Array.isArray(group.hops) && group.hops.length > 0
         ? group.hops
-        : [{ index: '-', text: group.summaryText || '没有 traceroute 输出' }];
+        : [{ index: '-', text: group.summaryText || '没有路由探测输出', sampleLatenciesMs: [], expectedProbeCount: 1 }];
       table.append(...hops.map((hop) => createMtrRow(group.host, hop)));
 
       card.append(head, summary, table);
@@ -463,14 +619,19 @@
   function liveHopMetrics(host, hop) {
     const stats = state.traceStats[host]?.hops?.[String(hop.index)];
     if (!stats) {
+      const sampleLatenciesMs = normalizedHopSamples(hop);
+      const inlineStats = summarizeLatencies(sampleLatenciesMs);
+      const expectedProbeCount = normalizedExpectedProbeCount(hop);
       return {
-        avg: hop.latencyMs,
-        best: hop.latencyMs,
-        last: hop.latencyMs,
-        loss: hop.timedOut ? 100 : 0,
-        sent: 1,
-        stdev: null,
-        worst: hop.latencyMs,
+        avg: inlineStats.avg,
+        best: inlineStats.best,
+        last: inlineStats.last,
+        loss: expectedProbeCount > 0
+          ? Number(((expectedProbeCount - sampleLatenciesMs.length) / expectedProbeCount * 100).toFixed(1))
+          : 0,
+        sent: expectedProbeCount,
+        stdev: inlineStats.stdev,
+        worst: inlineStats.worst,
       };
     }
 
@@ -502,6 +663,51 @@
   function remainingPercent(usage) {
     if (!usage || usage.dailyLimit <= 0) return 0;
     return Math.max(0, Math.min(100, Math.round(100 - usage.dailyUsage / usage.dailyLimit * 100)));
+  }
+
+  function normalizeRemaining(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0;
+  }
+
+  function normalizeAppVersion(value) {
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  function isResetVersionSupported() {
+    const appVersion = state.reset.appVersion;
+    if (!appVersion) return false;
+    return compareVersions(appVersion, '1.8.0') >= 0;
+  }
+
+  function versionGateMessage() {
+    const current = state.reset.appVersion || '未知版本';
+    return `当前版本 ${current} 过低，请升级到 1.8.0 以上版本后再执行重置。`;
+  }
+
+  function isVersionGateMessage(text) {
+    return typeof text === 'string' && text.includes('请升级到 1.8.0 以上版本');
+  }
+
+  function compareVersions(left, right) {
+    const leftParts = versionParts(left);
+    const rightParts = versionParts(right);
+    const length = Math.max(leftParts.length, rightParts.length);
+
+    for (let index = 0; index < length; index += 1) {
+      const leftValue = leftParts[index] || 0;
+      const rightValue = rightParts[index] || 0;
+      if (leftValue > rightValue) return 1;
+      if (leftValue < rightValue) return -1;
+    }
+    return 0;
+  }
+
+  function versionParts(value) {
+    const matches = String(value || '').match(/\d+/g) || [];
+    return matches
+      .map((part) => Number.parseInt(part, 10))
+      .filter((part) => Number.isFinite(part));
   }
 
   function normalizeLines(lines) {
@@ -538,7 +744,7 @@
 
     state.liveTimerId = setInterval(() => {
       runLiveProbe();
-    }, LIVE_PROBE_INTERVAL_MS);
+    }, liveProbeIntervalMs());
   }
 
   function stopLiveProbing() {
@@ -608,26 +814,75 @@
           totalLatencySquared: 0,
           latestLatencyMs: null,
         };
-        hopStats.sent += 1;
-        if (hop.latencyMs == null || hop.timedOut) {
-          hopStats.lost += 1;
-        } else {
+        const sampleLatenciesMs = normalizedHopSamples(hop);
+        const expectedProbeCount = normalizedExpectedProbeCount(hop);
+        hopStats.sent += expectedProbeCount;
+        hopStats.lost += Math.max(0, expectedProbeCount - sampleLatenciesMs.length);
+
+        for (const sampleLatency of sampleLatenciesMs) {
           hopStats.received += 1;
-          hopStats.totalLatency += hop.latencyMs;
-          hopStats.totalLatencySquared += hop.latencyMs * hop.latencyMs;
-          hopStats.latestLatencyMs = hop.latencyMs;
+          hopStats.totalLatency += sampleLatency;
+          hopStats.totalLatencySquared += sampleLatency * sampleLatency;
+          hopStats.latestLatencyMs = sampleLatency;
           hopStats.bestLatencyMs = hopStats.bestLatencyMs == null
-            ? hop.latencyMs
-            : Math.min(hopStats.bestLatencyMs, hop.latencyMs);
+            ? sampleLatency
+            : Math.min(hopStats.bestLatencyMs, sampleLatency);
           hopStats.worstLatencyMs = hopStats.worstLatencyMs == null
-            ? hop.latencyMs
-            : Math.max(hopStats.worstLatencyMs, hop.latencyMs);
+            ? sampleLatency
+            : Math.max(hopStats.worstLatencyMs, sampleLatency);
         }
         hostStats.hops[key] = hopStats;
       }
 
       state.traceStats[group.host] = hostStats;
     }
+  }
+
+  function normalizedHopSamples(hop) {
+    if (Array.isArray(hop?.sampleLatenciesMs)) {
+      return hop.sampleLatenciesMs
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value));
+    }
+    const fallbackLatency = Number(hop?.latencyMs);
+    return Number.isFinite(fallbackLatency) ? [fallbackLatency] : [];
+  }
+
+  function normalizedExpectedProbeCount(hop) {
+    const expected = Number(hop?.expectedProbeCount);
+    return Number.isFinite(expected) && expected > 0 ? expected : 1;
+  }
+
+  function summarizeLatencies(latencies) {
+    if (!Array.isArray(latencies) || latencies.length === 0) {
+      return {
+        avg: null,
+        best: null,
+        last: null,
+        stdev: null,
+        worst: null,
+      };
+    }
+
+    const total = latencies.reduce((sum, value) => sum + value, 0);
+    const avg = total / latencies.length;
+    const variance = latencies.length > 1
+      ? latencies.reduce((sum, value) => sum + (value - avg) * (value - avg), 0) / latencies.length
+      : 0;
+
+    return {
+      avg,
+      best: Math.min(...latencies),
+      last: latencies[latencies.length - 1],
+      stdev: latencies.length > 1 ? Math.sqrt(variance) : 0,
+      worst: Math.max(...latencies),
+    };
+  }
+
+  function liveProbeIntervalMs() {
+    return state.platform === 'win32'
+      ? WINDOWS_LIVE_PROBE_INTERVAL_MS
+      : DEFAULT_LIVE_PROBE_INTERVAL_MS;
   }
 
   async function copyEndpointHost() {

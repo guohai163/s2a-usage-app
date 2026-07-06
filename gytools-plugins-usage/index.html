@@ -29,6 +29,16 @@
         <strong id="updatedValue">-</strong>
         <span id="statusText">等待刷新</span>
       </article>
+      <article class="summary-panel reset-panel">
+        <span class="panel-label">Usage Reset</span>
+        <strong id="resetRemainingValue">-</strong>
+        <code id="resetMaskedKey" class="reset-key">KEY -</code>
+        <div class="reset-actions" aria-label="用量重置操作">
+          <button id="resetQueryButton" class="ghost-button" type="button">查询机会</button>
+          <button id="resetButton" class="danger-button" type="button" disabled>重置用量</button>
+        </div>
+        <span id="resetStatusText">先查询是否还有重置机会</span>
+      </article>
     </section>
 
     <section class="meter-panel" aria-label="用量周期">
@@ -75,7 +85,7 @@
       <ul id="endpointLines" class="endpoint-lines"></ul>
       <div class="trace-section">
         <div class="trace-title-row">
-          <span class="panel-label">Traceroute 链路</span>
+          <span class="panel-label">路由链路</span>
           <span id="traceCount" class="trace-count">0 nodes</span>
         </div>
         <div id="traceRoutes" class="trace-routes"></div>

@@ -9,7 +9,10 @@ const AUTH_PATH = path.join(os.homedir(), '.codex', 'auth.json');
 const CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
 const REQUEST_TIMEOUT_MS = 15000;
 const SETTINGS_TIMEOUT_MS = 12000;
-const TRACEROUTE_TIMEOUT_MS = 20000;
+const MAC_TRACEROUTE_TIMEOUT_MS = 20000;
+const WINDOWS_TRACERT_TIMEOUT_MS = 60000;
+const QUOTA_REMAINING_URL = 'https://s2adb.gydev.cn/api/quota/remaining';
+const QUOTA_RESET_URL = 'https://s2adb.gydev.cn/api/quota/reset';
 
 async function loadUsageSnapshot() {
   const apiKey = await loadAPIKey();
@@ -69,6 +72,37 @@ async function probeEndpointCandidates(candidates = []) {
     throw new Error('没有可探测的 custom_endpoints 节点。');
   }
   return probeEndpoints(normalizedCandidates, false, null, normalizedCandidates);
+}
+
+async function checkQuotaResetRemaining() {
+  const apiKey = await loadAPIKey();
+  const payload = await requestJSON(QUOTA_REMAINING_URL, {
+    body: JSON.stringify({ key: apiKey }),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    statusMessage: '查询重置机会失败',
+    timeoutMs: REQUEST_TIMEOUT_MS,
+  });
+  return parseQuotaRemaining(payload);
+}
+
+async function resetQuota() {
+  const apiKey = await loadAPIKey();
+  const payload = await requestJSON(QUOTA_RESET_URL, {
+    body: JSON.stringify({ key: apiKey }),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    statusMessage: '重置用量失败',
+    timeoutMs: REQUEST_TIMEOUT_MS,
+  });
+  return parseQuotaReset(payload);
+}
+
+async function getMaskedAPIKey() {
+  const apiKey = await loadAPIKey();
+  return {
+    maskedKey: maskAPIKey(apiKey),
+  };
 }
 
 async function loadAPIKey() {
@@ -166,9 +200,18 @@ function normalizeBaseURL(value) {
   }
 }
 
+function maskAPIKey(value) {
+  const key = String(value || '').trim();
+  if (!key) return '-';
+  if (key.length <= 20) return key;
+  return `${key.slice(0, 10)}...${key.slice(-10)}`;
+}
+
 function requestJSON(urlString, options = {}) {
   const {
+    body = null,
     headers = {},
+    method = 'GET',
     redirectCount = 0,
     statusMessage = '请求失败',
     timeoutMs = REQUEST_TIMEOUT_MS,
@@ -184,13 +227,19 @@ function requestJSON(urlString, options = {}) {
     }
 
     const transport = url.protocol === 'http:' ? http : https;
-    const request = transport.request(url, { headers, method: 'GET' }, (response) => {
+    const requestHeaders = { ...headers };
+    if (body != null && requestHeaders['Content-Length'] == null && requestHeaders['content-length'] == null) {
+      requestHeaders['Content-Length'] = Buffer.byteLength(body);
+    }
+    const request = transport.request(url, { headers: requestHeaders, method }, (response) => {
       const statusCode = response.statusCode || 0;
       const location = response.headers.location;
       if (statusCode >= 300 && statusCode < 400 && location && redirectCount < 3) {
         response.resume();
         requestJSON(new URL(location, url).toString(), {
+          body,
           headers,
+          method,
           redirectCount: redirectCount + 1,
           statusMessage,
           timeoutMs,
@@ -224,8 +273,149 @@ function requestJSON(urlString, options = {}) {
     request.setTimeout(timeoutMs, () => {
       request.destroy(new Error('请求超时'));
     });
+    if (body != null) {
+      request.write(body);
+    }
     request.end();
   });
+}
+
+function parseQuotaRemaining(payload) {
+  const remaining = findFirstNumber(payload, [
+    'remaining',
+    'remain',
+    'count',
+    'quota',
+    'chance',
+    'chances',
+    'resetRemaining',
+    'reset_remaining',
+    'remainingResets',
+    'remaining_resets',
+  ]);
+  if (remaining == null) {
+    throw new Error('重置机会响应中没有可识别的 remaining/count 字段。');
+  }
+
+  return {
+    remaining: Math.max(0, Math.floor(remaining)),
+    message: findMessage(payload),
+    raw: payload,
+  };
+}
+
+function parseQuotaReset(payload) {
+  const explicitSuccess = findFirstBoolean(payload, ['success', 'ok']);
+  const code = findFirstNumber(payload, ['code', 'statusCode']);
+  const status = findFirstText(payload, ['status', 'state', 'result']);
+  const success = explicitSuccess != null
+    ? explicitSuccess
+    : code != null
+      ? code === 0 || (code >= 200 && code < 300)
+      : status
+        ? ['ok', 'success', 'succeeded', 'done'].includes(status.toLowerCase())
+        : null;
+  const remaining = findFirstNumber(payload, [
+    'remaining',
+    'remain',
+    'count',
+    'resetRemaining',
+    'reset_remaining',
+    'remainingResets',
+    'remaining_resets',
+  ]);
+
+  return {
+    success,
+    hasExplicitOutcome: explicitSuccess != null || code != null || status != null,
+    remaining: remaining == null ? null : Math.max(0, Math.floor(remaining)),
+    message: findMessage(payload) || (success === false ? '重置失败。' : null),
+    raw: payload,
+  };
+}
+
+function findMessage(value) {
+  return findFirstText(value, ['message', 'msg', 'detail', 'error', 'reason']);
+}
+
+function findFirstNumber(value, keys) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFirstNumber(item, keys);
+      if (found != null) return found;
+    }
+    return null;
+  }
+  if (!isRecord(value)) return null;
+
+  for (const key of keys) {
+    if (value[key] == null) continue;
+    const found = findFirstNumber(value[key], keys);
+    if (found != null) return found;
+  }
+  for (const nested of ['data', 'result', 'payload']) {
+    if (value[nested] == null) continue;
+    const found = findFirstNumber(value[nested], keys);
+    if (found != null) return found;
+  }
+  return null;
+}
+
+function findFirstBoolean(value, keys) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', 'yes', 'ok', 'success', '1'].includes(normalized)) return true;
+    if (['false', 'no', 'fail', 'failed', '0'].includes(normalized)) return false;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFirstBoolean(item, keys);
+      if (found != null) return found;
+    }
+    return null;
+  }
+  if (!isRecord(value)) return null;
+
+  for (const key of keys) {
+    if (value[key] == null) continue;
+    const found = findFirstBoolean(value[key], keys);
+    if (found != null) return found;
+  }
+  for (const nested of ['data', 'result', 'payload']) {
+    if (value[nested] == null) continue;
+    const found = findFirstBoolean(value[nested], keys);
+    if (found != null) return found;
+  }
+  return null;
+}
+
+function findFirstText(value, keys) {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFirstText(item, keys);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!isRecord(value)) return null;
+
+  for (const key of keys) {
+    if (typeof value[key] === 'string' && value[key].trim()) {
+      return value[key].trim();
+    }
+  }
+  for (const nested of ['data', 'result', 'payload']) {
+    const found = findFirstText(value[nested], keys);
+    if (found) return found;
+  }
+  return null;
 }
 
 function parseSnapshot(object) {
@@ -555,39 +745,82 @@ async function probeEndpoints(candidates, isFromCache, fallbackReason, cacheCand
     throw new Error('没有可探测的 custom_endpoints 节点。');
   }
 
-  const results = await Promise.all(limitedCandidates.map((candidate) => runTraceroute(candidate)));
+  const results = await Promise.all(limitedCandidates.map((candidate) => runRouteProbe(candidate)));
   return createRecommendation(results, isFromCache, fallbackReason, cacheCandidates || limitedCandidates);
 }
 
-function runTraceroute(candidate) {
-  if (process.platform !== 'darwin') {
-    return Promise.resolve(probeError(candidate, '当前平台暂不支持 traceroute 探测'));
+function runRouteProbe(candidate) {
+  if (process.platform === 'darwin') {
+    return runUnixTraceroute(candidate);
   }
+  if (process.platform === 'win32') {
+    return runWindowsTracert(candidate);
+  }
+  return Promise.resolve(probeError(candidate, '当前平台暂不支持路由探测'));
+}
 
-  const traceroutePath = findTraceroutePath();
+function runUnixTraceroute(candidate) {
+  const traceroutePath = findMacTraceroutePath();
   if (!traceroutePath) {
     return Promise.resolve(probeError(candidate, '未找到 traceroute'));
   }
 
+  return runProbeCommand(
+    traceroutePath,
+    ['-n', '-q', '1', '-m', '16', '-w', '1', candidate.host],
+    MAC_TRACEROUTE_TIMEOUT_MS,
+    candidate,
+    parseUnixTracerouteOutput,
+  ).then((outcome) => outcome.result);
+}
+
+async function runWindowsTracert(candidate) {
+  const executables = windowsTracertExecutables();
+  let lastError = null;
+
+  for (const executable of executables) {
+    const outcome = await runProbeCommand(
+      executable,
+      ['-d', '-h', '16', '-w', '600', candidate.host],
+      WINDOWS_TRACERT_TIMEOUT_MS,
+      candidate,
+      parseWindowsTracertOutput,
+    );
+
+    if (outcome.error) {
+      lastError = outcome.error;
+      if (outcome.error.code === 'ENOENT') {
+        continue;
+      }
+      return probeError(candidate, outcome.error.message);
+    }
+
+    return outcome.result;
+  }
+
+  return probeError(candidate, lastError?.code === 'ENOENT' ? '未找到 tracert' : (lastError?.message || '未找到 tracert'));
+}
+
+function runProbeCommand(executable, args, timeoutMs, candidate, parser) {
   return new Promise((resolve) => {
     let output = '';
     let timedOut = false;
     let settled = false;
-    const child = spawn(traceroutePath, ['-n', '-q', '1', '-m', '16', '-w', '1', candidate.host], {
+    const child = spawn(executable, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    const finish = (result) => {
+    const finish = (payload) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(result);
+      resolve(payload);
     };
 
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill('SIGTERM');
-    }, TRACEROUTE_TIMEOUT_MS);
+    }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
       output += chunk.toString('utf8');
@@ -596,15 +829,15 @@ function runTraceroute(candidate) {
       output += chunk.toString('utf8');
     });
     child.on('error', (error) => {
-      finish(probeError(candidate, error.message));
+      finish({ error });
     });
     child.on('close', (code) => {
-      finish(parseTracerouteOutput(output, candidate, timedOut, code ?? (timedOut ? 1 : 0)));
+      finish({ result: parser(output, candidate, timedOut, code ?? (timedOut ? 1 : 0)) });
     });
   });
 }
 
-function findTraceroutePath() {
+function findMacTraceroutePath() {
   return ['/usr/sbin/traceroute', '/sbin/traceroute', '/usr/bin/traceroute']
     .find((candidate) => {
       try {
@@ -616,7 +849,17 @@ function findTraceroutePath() {
     }) || null;
 }
 
-function parseTracerouteOutput(output, candidate, timedOut, terminationStatus) {
+function windowsTracertExecutables() {
+  const executables = ['tracert'];
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+  const fallback = path.join(systemRoot, 'System32', 'tracert.exe');
+  if (!executables.includes(fallback)) {
+    executables.push(fallback);
+  }
+  return executables;
+}
+
+function parseUnixTracerouteOutput(output, candidate, timedOut, terminationStatus) {
   let hopCount = 0;
   let timeoutHops = 0;
   const latencies = [];
@@ -631,12 +874,15 @@ function parseTracerouteOutput(output, candidate, timedOut, terminationStatus) {
     hopCount = Math.max(hopCount, hopNumber);
     if (trimmed.includes('*')) timeoutHops += 1;
     latencies.push(...lineLatencies);
+    const sampleLatenciesMs = lineLatencies.slice();
     hops.push({
       index: hopNumber,
       text: formatHopLine(trimmed, hopNumber),
       address: hopAddress(trimmed, hopNumber),
-      latencyMs: lineLatencies.length ? lineLatencies[lineLatencies.length - 1] : null,
-      timedOut: trimmed.includes('*') || lineLatencies.length === 0,
+      latencyMs: sampleLatenciesMs.length ? sampleLatenciesMs[sampleLatenciesMs.length - 1] : null,
+      sampleLatenciesMs,
+      expectedProbeCount: 1,
+      timedOut: sampleLatenciesMs.length === 0,
     });
   }
 
@@ -660,6 +906,121 @@ function parseTracerouteOutput(output, candidate, timedOut, terminationStatus) {
   });
 }
 
+function parseWindowsTracertOutput(output, candidate, timedOut, terminationStatus) {
+  let hopCount = 0;
+  let timeoutHops = 0;
+  const latencies = [];
+  const hops = [];
+
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const hopMatch = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (!hopMatch) continue;
+
+    const hopNumber = Number.parseInt(hopMatch[1], 10);
+    if (!Number.isFinite(hopNumber)) continue;
+
+    const parsedHop = parseWindowsTracertHop(hopMatch[2], hopNumber);
+    if (!parsedHop) continue;
+
+    hopCount = Math.max(hopCount, hopNumber);
+    if (parsedHop.sampleLatenciesMs.length < parsedHop.expectedProbeCount) {
+      timeoutHops += 1;
+    }
+    latencies.push(...parsedHop.sampleLatenciesMs);
+    hops.push(parsedHop);
+  }
+
+  const averageLatencyMs = latencies.length
+    ? latencies.reduce((sum, latency) => sum + latency, 0) / latencies.length
+    : null;
+  const lastLatencyMs = latencies.length ? latencies[latencies.length - 1] : null;
+  const errorMessage = latencies.length === 0
+    ? firstUsefulProbeLine(output) || (terminationStatus !== 0 ? 'tracert 未返回可用数据' : '路由探测未返回可用数据')
+    : null;
+
+  return decorateProbeResult({
+    candidate,
+    hopCount,
+    timeoutHops,
+    lastLatencyMs,
+    averageLatencyMs,
+    timedOut,
+    errorMessage,
+    hops,
+  });
+}
+
+function parseWindowsTracertHop(rest, hopNumber) {
+  const tokens = String(rest || '').trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return null;
+
+  const parsedSamples = [];
+  let index = 0;
+
+  for (let probeIndex = 0; probeIndex < 3; probeIndex += 1) {
+    const parsedSample = parseWindowsLatencyToken(tokens, index);
+    if (!parsedSample) {
+      return null;
+    }
+    parsedSamples.push(parsedSample.latencyMs);
+    index = parsedSample.nextIndex;
+  }
+
+  const addressText = tokens.slice(index).join(' ').trim();
+  const sampleLatenciesMs = parsedSamples.filter((value) => typeof value === 'number');
+  const address = normalizeWindowsHopAddress(addressText);
+  const timedOut = sampleLatenciesMs.length === 0;
+
+  return {
+    index: hopNumber,
+    text: addressText || 'Request timed out.',
+    address,
+    latencyMs: sampleLatenciesMs.length ? sampleLatenciesMs[sampleLatenciesMs.length - 1] : null,
+    sampleLatenciesMs,
+    expectedProbeCount: parsedSamples.length,
+    timedOut,
+  };
+}
+
+function parseWindowsLatencyToken(tokens, startIndex) {
+  const token = tokens[startIndex];
+  if (!token) return null;
+
+  if (token === '*') {
+    return { latencyMs: null, nextIndex: startIndex + 1 };
+  }
+
+  if (/^<?\d+$/i.test(token) && /^ms$/i.test(tokens[startIndex + 1] || '')) {
+    return {
+      latencyMs: Number(token.replace('<', '')),
+      nextIndex: startIndex + 2,
+    };
+  }
+
+  const inlineMatch = token.match(/^<?(\d+)ms$/i);
+  if (inlineMatch) {
+    return {
+      latencyMs: Number(inlineMatch[1]),
+      nextIndex: startIndex + 1,
+    };
+  }
+
+  return null;
+}
+
+function normalizeWindowsHopAddress(text) {
+  const value = String(text || '').trim();
+  if (!value || /^request timed out\.?$/i.test(value)) {
+    return '*';
+  }
+  const bracketMatch = value.match(/\[([^\]]+)\]\s*$/);
+  if (bracketMatch) {
+    return bracketMatch[1];
+  }
+  const parts = value.split(/\s+/);
+  return parts[parts.length - 1] || '*';
+}
+
 function latencyValues(text) {
   const values = [];
   const regex = /([0-9]+(?:\.[0-9]+)?)\s*ms/gi;
@@ -677,6 +1038,13 @@ function firstUsefulLine(output) {
     .find(Boolean) || null;
 }
 
+function firstUsefulProbeLine(output) {
+  return String(output || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^\d+\s+/.test(line) || /request timed out/i.test(line)) || null;
+}
+
 function probeError(candidate, message) {
   return decorateProbeResult({
     candidate,
@@ -686,7 +1054,15 @@ function probeError(candidate, message) {
     averageLatencyMs: null,
     timedOut: false,
     errorMessage: message,
-    hops: [{ index: '-', text: message, timedOut: false }],
+    hops: [{
+      index: '-',
+      text: message,
+      address: '*',
+      latencyMs: null,
+      sampleLatenciesMs: [],
+      expectedProbeCount: 1,
+      timedOut: false,
+    }],
   });
 }
 
@@ -768,7 +1144,15 @@ function traceGroups(results, recommended) {
     summaryText: result.summaryText,
     hops: Array.isArray(result.hops) && result.hops.length > 0
       ? result.hops
-      : [{ index: '-', text: result.errorMessage || '没有 traceroute 输出', timedOut: false }],
+      : [{
+        index: '-',
+        text: result.errorMessage || '没有路由探测输出',
+        address: '*',
+        latencyMs: null,
+        sampleLatenciesMs: [],
+        expectedProbeCount: 1,
+        timedOut: false,
+      }],
   }));
 }
 
@@ -778,7 +1162,7 @@ function recommendationDetailLines(results, recommended, isFromCache) {
     return failed.length ? failed : ['没有可探测的 custom_endpoints 节点。'];
   }
 
-  const heading = isFromCache ? '缓存节点 traceroute' : '全部节点 traceroute';
+  const heading = isFromCache ? '缓存节点路由探测' : '全部节点路由探测';
   const lines = results.map((result) => {
     const marker = result.candidate.host === recommended.candidate.host ? '推荐 ' : '';
     return `${marker}${candidateDisplayName(result.candidate)}: ${result.summaryText}`;
@@ -803,7 +1187,10 @@ function isRecord(value) {
 }
 
 module.exports = {
+  checkQuotaResetRemaining,
+  getMaskedAPIKey,
   loadEndpointRecommendation,
   loadUsageSnapshot,
   probeEndpointCandidates,
+  resetQuota,
 };
